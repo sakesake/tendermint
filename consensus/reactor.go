@@ -36,16 +36,24 @@ const (
 
 //-----------------------------------------------------------------------------
 
+// SimTransport enables routing messages through a simulated network
+// instead of the real p2p.Switch. Set via SetSimTransport().
+type SimTransport interface {
+	Send(to p2p.ID, envelope p2p.Envelope) bool
+	Broadcast(envelope p2p.Envelope)
+}
+
 // Reactor defines a reactor for the consensus service.
 type Reactor struct {
 	p2p.BaseReactor // BaseService + p2p.Switch
 
 	conS *State
 
-	mtx      tmsync.RWMutex
-	waitSync bool
-	eventBus *types.EventBus
-	rs       *cstypes.RoundState
+	mtx          tmsync.RWMutex
+	waitSync     bool
+	eventBus     *types.EventBus
+	rs           *cstypes.RoundState
+	simTransport SimTransport
 
 	Metrics *Metrics
 }
@@ -68,6 +76,11 @@ func NewReactor(consensusState *State, waitSync bool, options ...ReactorOption) 
 	}
 
 	return conR
+}
+
+// SetSimTransport sets a simulated transport for use in testing.
+func (conR *Reactor) SetSimTransport(t SimTransport) {
+	conR.simTransport = t
 }
 
 // OnStart implements BaseService by subscribing to events, which later will be
@@ -180,6 +193,7 @@ func (conR *Reactor) GetChannels() []*p2p.ChannelDescriptor {
 // InitPeer implements Reactor by creating a state for the peer.
 func (conR *Reactor) InitPeer(peer p2p.Peer) p2p.Peer {
 	peerState := NewPeerState(peer).SetLogger(conR.Logger)
+	peerState.simTransport = conR.simTransport
 	peer.Set(types.PeerStateKey, peerState)
 	return peer
 }
@@ -307,10 +321,15 @@ func (conR *Reactor) ReceiveEnvelope(e p2p.Envelope) {
 			if votes := ourVotes.ToProto(); votes != nil {
 				eMsg.Votes = *votes
 			}
-			p2p.TrySendEnvelopeShim(e.Src, p2p.Envelope{ //nolint: staticcheck
+			env := p2p.Envelope{ //nolint: staticcheck
 				ChannelID: VoteSetBitsChannel,
 				Message:   eMsg,
-			}, conR.Logger)
+			}
+			if conR.simTransport != nil {
+				conR.simTransport.Send(e.Src.ID(), env)
+			} else {
+				p2p.TrySendEnvelopeShim(e.Src, env, conR.Logger)
+			}
 		default:
 			conR.Logger.Error(fmt.Sprintf("Unknown message type %v", reflect.TypeOf(msg)))
 		}
@@ -459,10 +478,15 @@ func (conR *Reactor) unsubscribeFromBroadcastEvents() {
 
 func (conR *Reactor) broadcastNewRoundStepMessage(rs *cstypes.RoundState) {
 	nrsMsg := makeRoundStepMessage(rs)
-	conR.Switch.BroadcastEnvelope(p2p.Envelope{
+	env := p2p.Envelope{
 		ChannelID: StateChannel,
 		Message:   nrsMsg,
-	})
+	}
+	if conR.simTransport != nil {
+		conR.simTransport.Broadcast(env)
+	} else {
+		conR.Switch.BroadcastEnvelope(env)
+	}
 }
 
 func (conR *Reactor) broadcastNewValidBlockMessage(rs *cstypes.RoundState) {
@@ -474,10 +498,15 @@ func (conR *Reactor) broadcastNewValidBlockMessage(rs *cstypes.RoundState) {
 		BlockParts:         rs.ProposalBlockParts.BitArray().ToProto(),
 		IsCommit:           rs.Step == cstypes.RoundStepCommit,
 	}
-	conR.Switch.BroadcastEnvelope(p2p.Envelope{
+	env := p2p.Envelope{
 		ChannelID: StateChannel,
 		Message:   csMsg,
-	})
+	}
+	if conR.simTransport != nil {
+		conR.simTransport.Broadcast(env)
+	} else {
+		conR.Switch.BroadcastEnvelope(env)
+	}
 }
 
 // Broadcasts HasVoteMessage to peers that care.
@@ -488,10 +517,15 @@ func (conR *Reactor) broadcastHasVoteMessage(vote *types.Vote) {
 		Type:   vote.Type,
 		Index:  vote.ValidatorIndex,
 	}
-	conR.Switch.BroadcastEnvelope(p2p.Envelope{
+	env := p2p.Envelope{
 		ChannelID: StateChannel,
 		Message:   msg,
-	})
+	}
+	if conR.simTransport != nil {
+		conR.simTransport.Broadcast(env)
+	} else {
+		conR.Switch.BroadcastEnvelope(env)
+	}
 	/*
 		// TODO: Make this broadcast more selective.
 		for _, peer := range conR.Switch.Peers().List() {
@@ -530,10 +564,15 @@ func makeRoundStepMessage(rs *cstypes.RoundState) (nrsMsg *tmcons.NewRoundStep) 
 func (conR *Reactor) sendNewRoundStepMessage(peer p2p.Peer) {
 	rs := conR.getRoundState()
 	nrsMsg := makeRoundStepMessage(rs)
-	p2p.SendEnvelopeShim(peer, p2p.Envelope{ //nolint: staticcheck
+	env := p2p.Envelope{ //nolint: staticcheck
 		ChannelID: StateChannel,
 		Message:   nrsMsg,
-	}, conR.Logger)
+	}
+	if conR.simTransport != nil {
+		conR.simTransport.Send(peer.ID(), env)
+	} else {
+		p2p.SendEnvelopeShim(peer, env, conR.Logger)
+	}
 }
 
 func (conR *Reactor) updateRoundStateRoutine() {
@@ -577,14 +616,21 @@ OUTER_LOOP:
 					panic(err)
 				}
 				logger.Debug("Sending block part", "height", prs.Height, "round", prs.Round)
-				if p2p.SendEnvelopeShim(peer, p2p.Envelope{ //nolint: staticcheck
+				env := p2p.Envelope{ //nolint: staticcheck
 					ChannelID: DataChannel,
 					Message: &tmcons.BlockPart{
 						Height: rs.Height, // This tells peer that this part applies to us.
 						Round:  rs.Round,  // This tells peer that this part applies to us.
 						Part:   *parts,
 					},
-				}, logger) {
+				}
+				var sent bool
+				if conR.simTransport != nil {
+					sent = conR.simTransport.Send(peer.ID(), env)
+				} else {
+					sent = p2p.SendEnvelopeShim(peer, env, logger)
+				}
+				if sent {
 					ps.SetHasProposalBlockPart(prs.Height, prs.Round, index)
 				}
 				continue OUTER_LOOP
@@ -631,10 +677,17 @@ OUTER_LOOP:
 			// Proposal: share the proposal metadata with peer.
 			{
 				logger.Debug("Sending proposal", "height", prs.Height, "round", prs.Round)
-				if p2p.SendEnvelopeShim(peer, p2p.Envelope{ //nolint: staticcheck
+				propEnv := p2p.Envelope{ //nolint: staticcheck
 					ChannelID: DataChannel,
 					Message:   &tmcons.Proposal{Proposal: *rs.Proposal.ToProto()},
-				}, logger) {
+				}
+				var sentProposal bool
+				if conR.simTransport != nil {
+					sentProposal = conR.simTransport.Send(peer.ID(), propEnv)
+				} else {
+					sentProposal = p2p.SendEnvelopeShim(peer, propEnv, logger)
+				}
+				if sentProposal {
 					// NOTE[ZM]: A peer might have received different proposal msg so this Proposal msg will be rejected!
 					ps.SetHasProposal(rs.Proposal)
 				}
@@ -645,14 +698,19 @@ OUTER_LOOP:
 			// so we definitely have rs.Votes.Prevotes(rs.Proposal.POLRound).
 			if 0 <= rs.Proposal.POLRound {
 				logger.Debug("Sending POL", "height", prs.Height, "round", prs.Round)
-				p2p.SendEnvelopeShim(peer, p2p.Envelope{ //nolint: staticcheck
+				polEnv := p2p.Envelope{ //nolint: staticcheck
 					ChannelID: DataChannel,
 					Message: &tmcons.ProposalPOL{
 						Height:           rs.Height,
 						ProposalPolRound: rs.Proposal.POLRound,
 						ProposalPol:      *rs.Votes.Prevotes(rs.Proposal.POLRound).BitArray().ToProto(),
 					},
-				}, logger)
+				}
+				if conR.simTransport != nil {
+					conR.simTransport.Send(peer.ID(), polEnv)
+				} else {
+					p2p.SendEnvelopeShim(peer, polEnv, logger)
+				}
 			}
 			continue OUTER_LOOP
 		}
@@ -695,14 +753,21 @@ func (conR *Reactor) gossipDataForCatchup(logger log.Logger, rs *cstypes.RoundSt
 			logger.Error("Could not convert part to proto", "index", index, "error", err)
 			return
 		}
-		if p2p.SendEnvelopeShim(peer, p2p.Envelope{ //nolint: staticcheck
+		catchupEnv := p2p.Envelope{ //nolint: staticcheck
 			ChannelID: DataChannel,
 			Message: &tmcons.BlockPart{
 				Height: prs.Height, // Not our height, so it doesn't matter.
 				Round:  prs.Round,  // Not our height, so it doesn't matter.
 				Part:   *pp,
 			},
-		}, logger) {
+		}
+		var sentCatchup bool
+		if conR.simTransport != nil {
+			sentCatchup = conR.simTransport.Send(peer.ID(), catchupEnv)
+		} else {
+			sentCatchup = p2p.SendEnvelopeShim(peer, catchupEnv, logger)
+		}
+		if sentCatchup {
 			ps.SetHasProposalBlockPart(prs.Height, prs.Round, index)
 		} else {
 			logger.Debug("Sending block part for catchup failed")
@@ -862,7 +927,7 @@ OUTER_LOOP:
 			if rs.Height == prs.Height {
 				if maj23, ok := rs.Votes.Prevotes(prs.Round).TwoThirdsMajority(); ok {
 
-					p2p.TrySendEnvelopeShim(peer, p2p.Envelope{ //nolint: staticcheck
+					env910 := p2p.Envelope{ //nolint: staticcheck
 						ChannelID: StateChannel,
 						Message: &tmcons.VoteSetMaj23{
 							Height:  prs.Height,
@@ -870,7 +935,12 @@ OUTER_LOOP:
 							Type:    tmproto.PrevoteType,
 							BlockID: maj23.ToProto(),
 						},
-					}, ps.logger)
+					}
+					if conR.simTransport != nil {
+						conR.simTransport.Send(peer.ID(), env910)
+					} else {
+						p2p.TrySendEnvelopeShim(peer, env910, ps.logger)
+					}
 					time.Sleep(conR.conS.config.PeerQueryMaj23SleepDuration)
 				}
 			}
@@ -882,7 +952,7 @@ OUTER_LOOP:
 			prs := ps.GetRoundState()
 			if rs.Height == prs.Height {
 				if maj23, ok := rs.Votes.Precommits(prs.Round).TwoThirdsMajority(); ok {
-					p2p.TrySendEnvelopeShim(peer, p2p.Envelope{ //nolint: staticcheck
+					env930 := p2p.Envelope{ //nolint: staticcheck
 						ChannelID: StateChannel,
 						Message: &tmcons.VoteSetMaj23{
 							Height:  prs.Height,
@@ -890,7 +960,12 @@ OUTER_LOOP:
 							Type:    tmproto.PrecommitType,
 							BlockID: maj23.ToProto(),
 						},
-					}, ps.logger)
+					}
+					if conR.simTransport != nil {
+						conR.simTransport.Send(peer.ID(), env930)
+					} else {
+						p2p.TrySendEnvelopeShim(peer, env930, ps.logger)
+					}
 					time.Sleep(conR.conS.config.PeerQueryMaj23SleepDuration)
 				}
 			}
@@ -903,7 +978,7 @@ OUTER_LOOP:
 			if rs.Height == prs.Height && prs.ProposalPOLRound >= 0 {
 				if maj23, ok := rs.Votes.Prevotes(prs.ProposalPOLRound).TwoThirdsMajority(); ok {
 
-					p2p.TrySendEnvelopeShim(peer, p2p.Envelope{ //nolint: staticcheck
+					env951 := p2p.Envelope{ //nolint: staticcheck
 						ChannelID: StateChannel,
 						Message: &tmcons.VoteSetMaj23{
 							Height:  prs.Height,
@@ -911,7 +986,12 @@ OUTER_LOOP:
 							Type:    tmproto.PrevoteType,
 							BlockID: maj23.ToProto(),
 						},
-					}, ps.logger)
+					}
+					if conR.simTransport != nil {
+						conR.simTransport.Send(peer.ID(), env951)
+					} else {
+						p2p.TrySendEnvelopeShim(peer, env951, ps.logger)
+					}
 					time.Sleep(conR.conS.config.PeerQueryMaj23SleepDuration)
 				}
 			}
@@ -926,7 +1006,7 @@ OUTER_LOOP:
 			if prs.CatchupCommitRound != -1 && prs.Height > 0 && prs.Height <= conR.conS.blockStore.Height() &&
 				prs.Height >= conR.conS.blockStore.Base() {
 				if commit := conR.conS.LoadCommit(prs.Height); commit != nil {
-					p2p.TrySendEnvelopeShim(peer, p2p.Envelope{ //nolint: staticcheck
+					env974 := p2p.Envelope{ //nolint: staticcheck
 						ChannelID: StateChannel,
 						Message: &tmcons.VoteSetMaj23{
 							Height:  prs.Height,
@@ -934,7 +1014,12 @@ OUTER_LOOP:
 							Type:    tmproto.PrecommitType,
 							BlockID: commit.BlockID.ToProto(),
 						},
-					}, ps.logger)
+					}
+					if conR.simTransport != nil {
+						conR.simTransport.Send(peer.ID(), env974)
+					} else {
+						p2p.TrySendEnvelopeShim(peer, env974, ps.logger)
+					}
 					time.Sleep(conR.conS.config.PeerQueryMaj23SleepDuration)
 				}
 			}
@@ -1026,8 +1111,9 @@ var (
 // NOTE: THIS GETS DUMPED WITH rpc/core/consensus.go.
 // Be mindful of what you Expose.
 type PeerState struct {
-	peer   p2p.Peer
-	logger log.Logger
+	peer         p2p.Peer
+	logger       log.Logger
+	simTransport SimTransport
 
 	mtx   sync.Mutex             // NOTE: Modify below using setters, never directly.
 	PRS   cstypes.PeerRoundState `json:"round_state"` // Exposed.
@@ -1149,12 +1235,19 @@ func (ps *PeerState) SetHasProposalBlockPart(height int64, round int32, index in
 func (ps *PeerState) PickSendVote(votes types.VoteSetReader) bool {
 	if vote, ok := ps.PickVoteToSend(votes); ok {
 		ps.logger.Debug("Sending vote message", "ps", ps, "vote", vote)
-		if p2p.SendEnvelopeShim(ps.peer, p2p.Envelope{ //nolint: staticcheck
+		voteEnv := p2p.Envelope{ //nolint: staticcheck
 			ChannelID: VoteChannel,
 			Message: &tmcons.Vote{
 				Vote: vote.ToProto(),
 			},
-		}, ps.logger) {
+		}
+		var sentVote bool
+		if ps.simTransport != nil {
+			sentVote = ps.simTransport.Send(ps.peer.ID(), voteEnv)
+		} else {
+			sentVote = p2p.SendEnvelopeShim(ps.peer, voteEnv, ps.logger)
+		}
+		if sentVote {
 			ps.SetHasVote(vote)
 			return true
 		}
@@ -1815,3 +1908,13 @@ func (m *VoteSetBitsMessage) String() string {
 }
 
 //-------------------------------------
+
+// DecodeMsg exports the internal message decoder for use by plugins.
+// It unmarshals raw bytes from the given channel into a consensus Message.
+func DecodeMsg(chID byte, bz []byte) (Message, error) {
+	pb := new(tmcons.Message)
+	if err := proto.Unmarshal(bz, pb); err != nil {
+		return nil, err
+	}
+	return MsgFromProto(pb)
+}

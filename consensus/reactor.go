@@ -252,13 +252,17 @@ func (conR *Reactor) ReceiveEnvelope(e p2p.Envelope) {
 	msg, err := MsgFromProto(m.(*tmcons.Message))
 	if err != nil {
 		conR.Logger.Error("Error decoding message", "src", e.Src, "chId", e.ChannelID, "err", err)
-		conR.Switch.StopPeerForError(e.Src, err)
+		if conR.Switch != nil {
+			conR.Switch.StopPeerForError(e.Src, err)
+		}
 		return
 	}
 
 	if err = msg.ValidateBasic(); err != nil {
 		conR.Logger.Error("Peer sent us invalid msg", "peer", e.Src, "msg", e.Message, "err", err)
-		conR.Switch.StopPeerForError(e.Src, err)
+		if conR.Switch != nil {
+			conR.Switch.StopPeerForError(e.Src, err)
+		}
 		return
 	}
 
@@ -279,7 +283,9 @@ func (conR *Reactor) ReceiveEnvelope(e p2p.Envelope) {
 			conR.conS.mtx.Unlock()
 			if err = msg.ValidateHeight(initialHeight); err != nil {
 				conR.Logger.Error("Peer sent us invalid msg", "peer", e.Src, "msg", msg, "err", err)
-				conR.Switch.StopPeerForError(e.Src, err)
+				if conR.Switch != nil {
+					conR.Switch.StopPeerForError(e.Src, err)
+				}
 				return
 			}
 			ps.ApplyNewRoundStepMessage(msg)
@@ -298,7 +304,9 @@ func (conR *Reactor) ReceiveEnvelope(e p2p.Envelope) {
 			// Peer claims to have a maj23 for some BlockID at H,R,S,
 			err := votes.SetPeerMaj23(msg.Round, msg.Type, ps.peer.ID(), msg.BlockID)
 			if err != nil {
-				conR.Switch.StopPeerForError(e.Src, err)
+				if conR.Switch != nil {
+					conR.Switch.StopPeerForError(e.Src, err)
+				}
 				return
 			}
 			// Respond with a VoteSetBitsMessage showing which votes we have.
@@ -1040,6 +1048,10 @@ func (conR *Reactor) peerStatsRoutine() {
 
 		select {
 		case msg := <-conR.conS.statsMsgQueue:
+			// Skip peer stats when running with simulated transport (no real Switch).
+			if conR.Switch == nil {
+				continue
+			}
 			// Get peer
 			peer := conR.Switch.Peers().Get(msg.PeerID)
 			if peer == nil {
@@ -1083,6 +1095,10 @@ func (conR *Reactor) String() string {
 func (conR *Reactor) StringIndented(indent string) string {
 	s := "ConsensusReactor{\n"
 	s += indent + "  " + conR.conS.StringIndented(indent+"  ") + "\n"
+	if conR.Switch == nil {
+		s += indent + "}"
+		return s
+	}
 	for _, peer := range conR.Switch.Peers().List() {
 		ps, ok := peer.Get(types.PeerStateKey).(*PeerState)
 		if !ok {

@@ -350,13 +350,21 @@ func (conR *Reactor) ReceiveEnvelope(e p2p.Envelope) {
 		switch msg := msg.(type) {
 		case *ProposalMessage:
 			ps.SetHasProposal(msg.Proposal)
-			conR.conS.peerMsgQueue <- msgInfo{msg, e.Src.ID()}
+			select {
+			case conR.conS.peerMsgQueue <- msgInfo{msg, e.Src.ID()}:
+			case <-conR.Quit():
+				return
+			}
 		case *ProposalPOLMessage:
 			ps.ApplyProposalPOLMessage(msg)
 		case *BlockPartMessage:
 			ps.SetHasProposalBlockPart(msg.Height, msg.Round, int(msg.Part.Index))
 			conR.Metrics.BlockParts.With("peer_id", string(e.Src.ID())).Add(1)
-			conR.conS.peerMsgQueue <- msgInfo{msg, e.Src.ID()}
+			select {
+			case conR.conS.peerMsgQueue <- msgInfo{msg, e.Src.ID()}:
+			case <-conR.Quit():
+				return
+			}
 		default:
 			conR.Logger.Error(fmt.Sprintf("Unknown message type %v", reflect.TypeOf(msg)))
 		}
@@ -376,7 +384,11 @@ func (conR *Reactor) ReceiveEnvelope(e p2p.Envelope) {
 			ps.EnsureVoteBitArrays(height-1, lastCommitSize)
 			ps.SetHasVote(msg.Vote)
 
-			cs.peerMsgQueue <- msgInfo{msg, e.Src.ID()}
+			select {
+			case cs.peerMsgQueue <- msgInfo{msg, e.Src.ID()}:
+			case <-conR.Quit():
+				return
+			}
 
 		default:
 			// don't punish (leave room for soft upgrades)

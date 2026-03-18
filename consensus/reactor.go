@@ -354,6 +354,7 @@ func (conR *Reactor) ReceiveEnvelope(e p2p.Envelope) {
 			case conR.conS.peerMsgQueue <- msgInfo{msg, e.Src.ID()}:
 			case <-conR.Quit():
 				return
+			default: // queue full — gossip will retransmit
 			}
 		case *ProposalPOLMessage:
 			ps.ApplyProposalPOLMessage(msg)
@@ -364,6 +365,7 @@ func (conR *Reactor) ReceiveEnvelope(e p2p.Envelope) {
 			case conR.conS.peerMsgQueue <- msgInfo{msg, e.Src.ID()}:
 			case <-conR.Quit():
 				return
+			default: // queue full — gossip will retransmit
 			}
 		default:
 			conR.Logger.Error(fmt.Sprintf("Unknown message type %v", reflect.TypeOf(msg)))
@@ -388,6 +390,7 @@ func (conR *Reactor) ReceiveEnvelope(e p2p.Envelope) {
 			case cs.peerMsgQueue <- msgInfo{msg, e.Src.ID()}:
 			case <-conR.Quit():
 				return
+			default: // queue full — gossip will retransmit
 			}
 
 		default:
